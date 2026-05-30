@@ -1,0 +1,184 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from layers.Autoformer_EncDec import series_decomp
+from loss.hl_gauss import HLGaussLossFromSupport
+
+class MultiViewPatternMemory(nn.Module):
+    """
+    [升级版] 多视角峰值检索模块
+    引入先验输入：
+    1. Time View: 原始序列形状
+    2. Diff View: 变化率 (一阶差分)，捕捉爆发势头
+    3. Freq View: 频域幅度谱 (FFT)，捕捉突变的高频能量
+    """
+    def __init__(self, input_len, output_dim, d_model=64, n_memory=50):
+        super().__init__()
+        self.n_memory = n_memory
+        self.input_len = input_len
+        self.output_dim = output_dim
+        
+        # --- 1. 多视角特征提取器 ---
+        
+        # A. 时域特征映射
+        self.time_encoder = nn.Linear(input_len, d_model)
+        
+        # B. 差分特征映射 (输入长度-1，padding后保持一致)
+        self.diff_encoder = nn.Linear(input_len, d_model)
+        
+        # C. 频域特征映射 (RFFT后长度约为 input_len/2 + 1)
+        fft_len = input_len // 2 + 1
+        self.freq_encoder = nn.Linear(fft_len, d_model)
+
+        # 融合层: 将三种视角的特征融合为一个 Query
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.Tanh(), 
+            nn.Linear(d_model, d_model) # Final Query Dimension
+        )
+        
+        # --- 2. 记忆库 (保持不变) ---
+        self.memory_keys = nn.Parameter(torch.randn(n_memory, d_model) * 0.02)
+        self.memory_values = nn.Parameter(torch.randn(n_memory, output_dim) * 0.02)
+        
+        # --- 3. 门控机制 (基于融合特征) ---
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.LeakyReLU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def get_prior_features(self, x):
+        """
+        计算先验特征
+        x: [B, L]
+        """
+        # 1. 一阶差分 (Velocity)
+        # 填充第一个位置以保持长度一致
+        diff = x[:, 1:] - x[:, :-1]
+        diff = F.pad(diff, (1, 0), mode='replicate') 
+        
+        # 2. 频域幅度 (Energy Spectrum)
+        # 只取幅度，丢弃相位 (相位对平移敏感，我们希望检索具有平移不变性)
+        x_fft = torch.fft.rfft(x, dim=-1)
+        freq_amp = torch.abs(x_fft)
+        # 归一化幅度，防止数值过大
+        freq_amp = F.normalize(freq_amp, dim=-1)
+        
+        return diff, freq_amp
+
+    def forward(self, x):
+        # x: [Batch, Seq_Len]
+        
+        # --- Step 1: 提取先验特征 ---
+        diff_view, freq_view = self.get_prior_features(x)
+        
+        # --- Step 2: 独立编码 ---
+        emb_time = self.time_encoder(x)          # [B, d]
+        emb_diff = self.diff_encoder(diff_view)  # [B, d]
+        emb_freq = self.freq_encoder(freq_view)  # [B, d]
+        
+        # --- Step 3: 融合生成 Query ---
+        # 拼接三个视角的特征
+        combined_feat = torch.cat([emb_time, emb_diff, emb_freq], dim=-1) # [B, 3d]
+        query = self.fusion_layer(combined_feat) # [B, d]
+        
+        # --- Step 4: 相似度匹配 (Attention) ---
+        query_norm = F.normalize(query, dim=1)
+        keys_norm = F.normalize(self.memory_keys, dim=1)
+        
+        similarity = torch.matmul(query_norm, keys_norm.t()) # [B, M]
+        attn_weights = F.softmax(similarity * 10.0, dim=-1)
+        
+        # --- Step 5: 检索与门控 ---
+        retrieved_content = torch.matmul(attn_weights, self.memory_values)
+        
+        # Gate 基于融合后的 Query 计算，因为它包含了最丰富的信息
+        gate = self.gate_net(query) 
+        
+        return retrieved_content * gate
+
+class Model(nn.Module):
+    def __init__(self, configs):
+        super(Model, self).__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.individual = configs.individual
+        self.channels = configs.enc_in
+        self.sigma = configs.sigma
+
+        # Decomposition
+        kernel_size = 25
+        self.decompsition = series_decomp(kernel_size)
+
+        # Distribution Config
+        self.num_bins = configs.num_bins
+        self.support = torch.linspace(-1, 1, self.num_bins + 1)
+        bin_w = (self.support[1] - self.support[0])
+        self.support = self.support.clone()
+        self.support[0]  -= 0.5 * bin_w
+        self.support[-1] += 0.5 * bin_w
+        self.prob_transformer = HLGaussLossFromSupport(self.support, sigma=self.sigma)
+
+        out_dim = self.pred_len * self.num_bins
+
+        # ============================================================
+        # 升级: 使用 MultiViewPatternMemory
+        # ============================================================
+        self.peak_memory = MultiViewPatternMemory(
+            input_len=self.seq_len, 
+            output_dim=out_dim, 
+            d_model=64, 
+            n_memory=64 # 稍微增加记忆槽位
+        )
+
+        if self.individual:
+            self.Linear_Seasonal = nn.ModuleList()
+            self.Linear_Trend = nn.ModuleList()
+            for i in range(self.channels):
+                self.Linear_Seasonal.append(nn.Linear(self.seq_len, out_dim))
+                self.Linear_Trend.append(nn.Linear(self.seq_len, out_dim))
+        else:
+            self.Linear_Seasonal = nn.Linear(self.seq_len, out_dim)
+            self.Linear_Trend = nn.Linear(self.seq_len, out_dim)
+
+    def forward(self, x):
+        # x: [B, L, C]
+        
+        # 1. 序列分解
+        seasonal_init, trend_init = self.decompsition(x)
+        seasonal_init = seasonal_init.permute(0, 2, 1)
+        trend_init = trend_init.permute(0, 2, 1)
+        
+        B, C, L = seasonal_init.shape
+        out_dim = self.pred_len * self.num_bins
+
+        # 2. Linear 主干
+        if self.individual:
+            seasonal_output = torch.zeros([B, C, out_dim], dtype=seasonal_init.dtype).to(x.device)
+            trend_output = torch.zeros([B, C, out_dim], dtype=trend_init.dtype).to(x.device)
+            for i in range(self.channels):
+                seasonal_output[:, i, :] = self.Linear_Seasonal[i](seasonal_init[:, i, :])
+                trend_output[:, i, :] = self.Linear_Trend[i](trend_init[:, i, :])
+        else:
+            seasonal_output = self.Linear_Seasonal(seasonal_init)
+            trend_output = self.Linear_Trend(trend_init)
+
+        # 3. 记忆检索 (基于原始序列 x)
+        # 原始序列包含最完整的高频和突变信息，分解后的 trend_init 可能过于平滑
+        x_input_reshaped = x.permute(0, 2, 1).reshape(B * C, L) 
+        
+        # [Multi-View Retrieval]
+        # 这里内部会自动计算差分和FFT
+        memory_bias = self.peak_memory(x_input_reshaped)
+        memory_bias = memory_bias.view(B, C, out_dim)
+
+        # 4. 融合
+        x_final = seasonal_output + trend_output + memory_bias
+        
+        # 5. 输出
+        x_final = x_final.view(B, C, self.pred_len, self.num_bins).permute(0, 2, 1, 3)
+        prob = x_final.softmax(dim=-1)
+        
+        return prob
